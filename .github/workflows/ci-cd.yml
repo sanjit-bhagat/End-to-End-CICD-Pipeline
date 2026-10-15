@@ -3,21 +3,21 @@ name: End-to-End DevOps CI/CD Pipeline
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  # Job 1: Run application tests
+  # 1. Run Python unit tests
   test:
-    name: Run Flask Tests
+    name: Python Tests
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -30,80 +30,133 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run automated tests
-        run: python -m pytest -v
+      - name: Run unit tests
+        run: pytest -v
 
-  # Job 2: Build Docker image
+  # 2. Build Docker image and upload it as an artifact
   build:
     name: Build Docker Image
     runs-on: ubuntu-latest
     needs: test
 
     steps:
-      - name: Checkout source code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Build Docker image
         run: |
-          docker build -t devops-dashboard:${{ github.sha }} .
+          docker build \
+            -t devops-dashboard:${{ github.sha }} .
 
       - name: Save Docker image
         run: |
-          docker save devops-dashboard:${{ github.sha }} -o image.tar
+          docker save devops-dashboard:${{ github.sha }} \
+            -o devops-dashboard.tar
 
       - name: Upload Docker image artifact
         uses: actions/upload-artifact@v4
         with:
-          name: docker-image
-          path: image.tar
+          name: devops-dashboard-image
+          path: devops-dashboard.tar
           retention-days: 1
 
-  # Job 3: Scan Docker image for vulnerabilities
+  # 3. Scan the Docker image for vulnerabilities
   security-scan:
-    name: Scan Docker Image
+    name: Trivy Security Scan
     runs-on: ubuntu-latest
     needs: build
 
     steps:
-      - name: Download Docker image
+      - name: Download Docker image artifact
         uses: actions/download-artifact@v4
         with:
-          name: docker-image
+          name: devops-dashboard-image
 
       - name: Load Docker image
-        run: docker load -i image.tar
+        run: docker load -i devops-dashboard.tar
 
-      - name: Scan image with Trivy
+      - name: Scan Docker image
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: devops-dashboard:${{ github.sha }}
           format: table
-          exit-code: "0"
           vuln-type: os,library
-          severity: CRITICAL,HIGH
+          severity: HIGH,CRITICAL
+          exit-code: "0"
 
-  # Job 4: Publish image to Docker Hub
+  # 4. Publish image to Docker Hub
   publish:
-    name: Publish Image to Docker Hub
+    name: Publish to Docker Hub
     runs-on: ubuntu-latest
-    needs: security-scan
+    needs: [test, build, security-scan]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
-      - name: Checkout source code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Login to Docker Hub
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push Docker image
-        run: |
-          docker build \
-            -t "${{ secrets.DOCKERHUB_USERNAME }}/devops-dashboard:${{ github.sha }}" \
-            -t "${{ secrets.DOCKERHUB_USERNAME }}/devops-dashboard:latest" .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/devops-dashboard:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/devops-dashboard:latest
 
-          docker push "${{ secrets.DOCKERHUB_USERNAME }}/devops-dashboard:${{ github.sha }}"
-          docker push "${{ secrets.DOCKERHUB_USERNAME }}/devops-dashboard:latest"
+  # 5. Deploy to local Kind Kubernetes cluster
+  deploy:
+    name: Deploy to Local Kubernetes
+    runs-on: self-hosted
+    needs: [test, build, security-scan, publish]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Kubernetes connection
+        shell: powershell
+        run: |
+          kubectl config current-context
+          kubectl get nodes
+
+      - name: Update deployment image
+        shell: powershell
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          $image = "$env:DOCKERHUB_USERNAME/devops-dashboard:$env:IMAGE_TAG"
+          kubectl set image deployment/devops-dashboard `
+            devops-dashboard=$image `
+            --namespace default
+
+      - name: Apply Kubernetes manifests
+        shell: powershell
+        run: |
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      - name: Wait for rollout
+        shell: powershell
+        run: |
+          kubectl rollout status deployment/devops-dashboard `
+            --namespace default `
+            --timeout=180s
+
+      - name: Verify deployment
+        shell: powershell
+        run: |
+          kubectl get deployments
+          kubectl get pods
+          kubectl get services

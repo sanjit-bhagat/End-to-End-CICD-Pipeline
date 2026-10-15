@@ -30,8 +30,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      
       - name: Run unit tests
-        run: pytest -v
+        run: |
+          python -c "import os, sys; print('Working directory:', os.getcwd()); print('Files:', os.listdir('.')); print('Python path:', sys.path)"
+          python -m pytest -v
+
 
   # 2. Build Docker image and upload it as an artifact
   build:
